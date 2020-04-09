@@ -1,17 +1,27 @@
 import argparse
-import re
-import os
+import logging
 import pickle
-import random
+import re
 
 import torch
 from tqdm import tqdm
+from transformers import BertTokenizer
 
 
 class Example:
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+    def size(self):
+        num = 0
+        if hasattr(self, 'x'):
+            num += len(self.x)
+        if hasattr(self, 'y'):
+            num += len(self.y)
+        if hasattr(self, 'k'):
+            num += len(self.k)
+        return num
 
     def __repr__(self):
         items = []
@@ -24,48 +34,55 @@ class Example:
             elif isinstance(v, str):
                 text += f'str: {v}'
             else:
-                text += f'type={type(v)}, {v}'
+                text += f'{type(v)}'
             text = '    ' + text + ','
             items.append(text)
-        items = '\n'.join(items) 
+        items = '\n'.join(items)
         return f'Example(\n{items}\n)'
 
 
 class DailyDataset:
 
-    def __init__(self, path, tokenizer, max_len, keywords_path=None):
+    def __init__(self, path, tokenizer, max_x_len=500,
+                 context_size=5, keywords_path=None):
+        self.path = path
         self.tokenizer = tokenizer
-        self.max_len = max_len
-        print('Load data from', path)
-        convs = self.load(path)
+        self.max_x_len = max_x_len
+        self.context_size = context_size
+        self.keywords_path = keywords_path
+        self.logger = self.get_logger('DailyDataset')
+
+        convs = self.load()
         convs = self.clean(convs)
-        print(f'{len(convs)} convs')
-        self.data = []
-        for conv in convs:
-            for i in range(1, len(conv)):
-                self.data.append((conv[max(i-5,0):i], conv[i]))
-        print(len(self.data), 'pairs')
-
-        self.has_keywords = False
+        self.data = self.make_pairs(convs)
         if keywords_path is not None:
-            self.has_keywords = True
-            with open(keywords_path) as f:
-                lines = f.readlines()
-            self.keywords = [line.strip().split() for line in lines]
-            assert len(self.data) == len(self.keywords)
+            self.data = self.load_keywords()
+        self.data.sort(key=lambda t: sum(map(len, t[0])) + len(t[1]))
+        self.examples = self.make_examples()
 
-            data_keywords = []
-            for (x, y), words in zip(self.data, self.keywords):
-                data_keywords.append((x, y, words))
-            self.data = data_keywords
-            print(f'{len(self.data)} with keywords')
+    def get_logger(self, class_name):
+        self.logger = logging.getLogger(__name__ + '.' + class_name)
+        self.logger.setLevel(logging.INFO)
+        hander = logging.StreamHandler()
+        hander.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            f'[%(levelname)s] [{class_name}.%(funcName)s] %(message)s')
+        hander.setFormatter(formatter)
+        self.logger.addHandler(hander)
+        return self.logger
 
-        self.data.sort(key=lambda d: sum(map(len, d[0])) + len(d[1]))
+    def __getitem__(self, index):
+        return self.examples[index]
 
-    def load(self, path):
-        with open(path) as f:
+    def __len__(self):
+        return len(self.examples)
+
+    def load(self):
+        self.logger.info(f'Loading data from "{self.path}"')
+        with open(self.path) as f:
             lines = f.readlines()
         convs = [line.split('__eou__')[:-1] for line in lines]
+        self.logger.info(f'{len(convs)} conversations loaded.')
         return convs
 
     def clean(self, convs):
@@ -81,41 +98,60 @@ class DailyDataset:
         convs_clean = []
         for conv in convs:
             convs_clean.append(list(map(_clean, conv)))
+        self.logger.info(f'{len(convs_clean)} conversations cleaned.')
         return convs_clean
 
-    def __len__(self):
-        return len(self.data)
+    def make_pairs(self, convs):
+        data = []
+        for conv in convs:
+            for i in range(1, len(conv)):
+                context = conv[max(i - self.context_size, 0):i]
+                data.append((context, conv[i]))
+        self.logger.info(f'{len(data)} pairs.')
+        return data
 
-    def __getitem__(self, index):
-        if self.has_keywords:
-            sents, y, k = self.data[index]
-            y = tokenizer.convert_tokens_to_string(tokenizer.tokenize(y))
-            example = Example(texts_x=sents, text_y=y, tokens_k=k)
-        else:
-            sents, y = self.data[index]
-            y = tokenizer.convert_tokens_to_string(tokenizer.tokenize(y))
-            example = Example(texts_x=sents, text_y=y)
-        x = []
-        for sent in reversed(sents):
-            sent = self.tokenizer.encode(sent)
-            if len(x) + len(sent) + 1 <= self.max_len:
-                x = sent + [self.tokenizer.sep_token_id] + x
+    def load_keywords(self):
+        with open(self.keywords_path) as f:
+            lines = f.readlines()
+        keywords = [line.strip().split() for line in lines]
+        assert len(self.data) == len(keywords)
+
+        data_keywords = []
+        for (x, y), words in zip(self.data, keywords):
+            data_keywords.append((x, y, words))
+        self.data = data_keywords
+        self.logger.info(f'{len(self.data)} pairs with keywords.')
+        return self.data
+
+    def make_examples(self):
+        self.examples = []
+        for d in tqdm(self.data, desc='Making Examples', dynamic_ncols=True):
+            self.examples.append(self.make_example(d))
+        return self.examples
+
+    def make_example(self, item):
+        context, text_y = item[0], item[1]
+        text_y = self.tokenizer.convert_tokens_to_string(self.tokenizer.tokenize(text_y))
+        example = Example(texts_x=context, text_y=text_y)
+
+        example.x = []
+        for sent in reversed(context):
+            tokens = self.tokenizer.tokenize(sent)
+            ids = self.tokenizer.convert_tokens_to_ids(tokens)
+            if len(example.x) + len(ids) + 2 <= self.max_x_len:
+                example.x = ids + [self.tokenizer.sep_token_id] + example.x
             else:
                 break
-        x = [self.tokenizer.cls_token_id] + x
-        y = self.tokenizer.encode(y)
-        y = [self.tokenizer.bos_token_id] + y + [self.tokenizer.sep_token_id]
-        example.x = x
-        example.y = y
+        example.x = [self.tokenizer.cls_token_id] + example.x
 
-        if self.has_keywords:
-            k = self.tokenizer.convert_tokens_to_ids(k)
-            # sep_k = [self.tokenizer.bos_token_id]
-            # for x in k:
-            #     sep_k.append(x)
-            #     sep_k.append(self.tokenizer.sep_token_id)
-            k = [self.tokenizer.bos_token_id] + k + [self.tokenizer.sep_token_id]
-            example.k = sep_k
+        tokens = self.tokenizer.tokenize(text_y)
+        ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        example.y = [self.tokenizer.bos_token_id] + ids + [self.tokenizer.sep_token_id]
+
+        if len(item) > 2:
+            example.tokens_k = item[2]
+            k = self.tokenizer.convert_tokens_to_ids(item[2])
+            example.k = [self.tokenizer.bos_token_id] + k + [self.tokenizer.sep_token_id]
         return example
 
 
@@ -123,7 +159,12 @@ class Batch:
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
-            
+
+    def to(self, device):
+        for k, v in self.__dict__.items():
+            if isinstance(v, torch.Tensor):
+                self.__dict__[k] = v.to(device)
+
     def __repr__(self):
         items = []
         for k, v in self.__dict__.items():
@@ -138,64 +179,56 @@ class Batch:
                 text += f'type={type(v)}, {v}'
             text = '    ' + text + ','
             items.append(text)
-        items = '\n'.join(items) 
+        items = '\n'.join(items)
         return f'Batch(\n{items}\n)'
-
-    def split(self, n):
-        if n == 1:
-            return [self]
-        values = self.__dict__.values()
-        batch_size = len(next(iter(values)))
-        for value in values:
-            assert len(value) == batch_size
-        sub_batches = []
-        sub_batch_size = (batch_size + n - 1) // n
-        for start in range(0, batch_size, sub_batch_size):
-            b = Batch()
-            for k, v in self.__dict__.items():
-                b.__dict__[k] = v[start:start+sub_batch_size]
-            sub_batches.append(b)
-        return sub_batches
-
-    def size(self):
-        return len(next(iter(self.__dict__.values())))
 
 
 class DataLoader:
 
-    def __init__(self, dataset, max_tokens, cache_path=None):
+    def __init__(self, dataset, max_tokens=2500):
         self.dataset = dataset
         self.max_tokens = max_tokens
+        self.logger = self.get_logger('DataLoader')
         self.batches = self.make_batches()
-        if cache_path is not None:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(self.batches, f)
-            print('Dump pickle to', cache_path)
+
+    def get_logger(self, class_name):
+        self.logger = logging.getLogger(__name__ + '.' + class_name)
+        self.logger.setLevel(logging.INFO)
+        hander = logging.StreamHandler()
+        hander.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            f'[%(levelname)s] [{class_name}.%(funcName)s] %(message)s')
+        hander.setFormatter(formatter)
+        self.logger.addHandler(hander)
+        return self.logger
+
+    def dump(self, pickle_path):
+        with open(pickle_path, 'wb') as f:
+            pickle.dump(self.batches, f)
+        self.logger.info(f'Dump to "{pickle_path}"')
+
+    def __getitem__(self, index):
+        return self.batches[index]
+
+    def __len__(self):
+        return len(self.batches)
 
     def make_batches(self):
         batches = []
-        batch, tokens = [], 0
-        for data in tqdm(self.dataset, desc='Batching'):
-            # num = len(data[0]) + len(data[1])
-            num = len(data.x) + len(data.y)
-            if self.dataset.has_keywords:
-                num += len(data.k)
-            tokens += num
-            batch.append(data)
-            if tokens == self.max_tokens:
-                batches.append(self.make_batch(batch))
-                batch, tokens = [], 0
-            elif tokens > self.max_tokens:
-                batches.append(self.make_batch(batch[:-1]))
-                batch, tokens = [data], num
+        examples, num = [], 0
+        for example in tqdm(self.dataset, desc='Batching', dynamic_ncols=True):
+            num += example.size()
+            examples.append(example)
+            if num == self.max_tokens:
+                batches.append(self.make_batch(examples))
+                examples, num = [], 0
+            elif num > self.max_tokens:
+                batches.append(self.make_batch(examples[:-1]))
+                examples, num = [example], example.size()
+        self.logger.info(f'{len(batches)} batches.')
         return batches
 
     def make_batch(self, examples):
-        # if self.dataset.has_keywords:
-        #     batch_x, batch_y, batch_k = list(zip(*batch))
-        # else:
-        #     batch_x, batch_y = list(zip(*batch))
-
         has_keywords = hasattr(examples[0], 'k')
         batch_x, batch_y = [], []
         batch_texts_x, batch_text_y = [], []
@@ -211,24 +244,18 @@ class DataLoader:
                 batch_k.append(torch.tensor(example.k))
                 batch_tokens_k.append(example.tokens_k)
 
-        # batch_x = [torch.tensor(x) for x in batch_x]
-        # batch_y = [torch.tensor(y) for y in batch_y]
-
         padding_value = self.dataset.tokenizer.pad_token_id
         batch_x = torch.nn.utils.rnn.pad_sequence(
             batch_x, batch_first=True, padding_value=padding_value)
         batch_y = torch.nn.utils.rnn.pad_sequence(
             batch_y, batch_first=True, padding_value=padding_value)
-
         batch = Batch(
-            batch_x=batch_x, 
+            batch_x=batch_x,
             batch_y=batch_y,
             batch_texts_x=batch_texts_x,
             batch_text_y=batch_text_y,
         )
-
-        if self.dataset.has_keywords:
-            # batch_k = [torch.tensor(k) for k in batch_k]
+        if has_keywords:
             batch_k = torch.nn.utils.rnn.pad_sequence(
                 batch_k, batch_first=True, padding_value=padding_value)
             batch.batch_k = batch_k
@@ -237,80 +264,40 @@ class DataLoader:
 
 
 if __name__ == '__main__':
-    import torch
-    from transformers import BertTokenizer
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', '-d', choices=['daily', 'cornell'], required=True)
-    parser.add_argument('--split', '-s', choices=['train', 'valid', 'test'], required=True)
-    parser.add_argument('--max_x_len', default=500, type=int)
-    parser.add_argument('--max_batch_tokens', default=2500, type=int)
+    parser.add_argument('--data_path', '-d', required=True)
     parser.add_argument('--kw_path', '-k', default=None)
+    parser.add_argument('--batch_size', '-b', default=2500, type=int)
     parser.add_argument('--pickle_path', '-p', default=None)
+    parser.add_argument('--max_x_len', default=500, type=int)
+    parser.add_argument('--context_size', default=5, type=int)
     args = parser.parse_args()
-
-    paths = {
-        'daily': {
-            'train': {
-                'data_path': 'data/dialogues_train.txt',
-                'keywords_path': 'data/keywords_train.txt',
-                'pickle_path': 'data/dialogues_train_keywords_2500_sep.pickle',
-            },
-            'valid': {
-                'data_path': 'data/dialogues_validation.txt',
-                'keywords_path': 'data/keywords_validation.txt',
-                'pickle_path': 'data/dialogues_validation_keywords_2500_sep.pickle',
-            },
-            'test': {
-                'data_path': 'data/dialogues_test.txt',
-                'keywords_path': 'data/keywords_test.txt',
-                'pickle_path': 'data/dialogues_test_keywords_2500_sep.pickle',
-            }
-        },
-        'cornell': {
-            'train': {
-                'data_path': 'cornellmovie_data/cornellmovie_train.txt',
-                'keywords_path': 'cornellmovie_data/keywords_train.txt',
-                'pickle_path': f'cornellmovie_data/cornellmovie_train_{args.max_batch_tokens}.pickle',
-            },
-            'valid': {
-                'data_path': 'cornellmovie_data/cornellmovie_valid.txt',
-                'keywords_path': 'cornellmovie_data/keywords_validation.txt',
-                'pickle_path': f'cornellmovie_data/cornellmovie_valid_{args.max_batch_tokens}.pickle',
-            },
-            'test': {
-                'data_path': 'cornellmovie_data/cornellmovie_test.txt',
-                'keywords_path': 'cornellmovie_data/keywords_test.txt',
-                'pickle_path': f'cornellmovie_data/cornellmovie_test_{args.max_batch_tokens}.pickle',
-            }
-        },
-    }
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased/')
     tokenizer.add_special_tokens({'bos_token': '[BOS]'})
 
-    kw_path = paths[args.dataset][args.split]['keywords_path'] \
-        if args.kw_path is None else args.kw_path
-    pickle_path = paths[args.dataset][args.split]['pickle_path'] \
-        if args.pickle_path is None else args.pickle_path
-    
     dataset = DailyDataset(
-        path=paths[args.dataset][args.split]['data_path'],
+        path=args.data_path,
         tokenizer=tokenizer,
-        max_len=args.max_x_len,
-        keywords_path=kw_path,
+        keywords_path=args.kw_path,
+        max_x_len=args.max_x_len,
+        context_size=args.context_size,
     )
     dataloader = DataLoader(
         dataset=dataset,
-        max_tokens=args.max_batch_tokens,
-        cache_path=pickle_path,
+        max_tokens=args.batch_size,
     )
+    dataloader.dump(args.pickle_path)
 
-    # with open(pickle_path, 'rb') as f:
-    #     batches = pickle.load(f)
-    # print(len(batches))
-    # sizes = [b.size() for b in batches]
-    # ave = sum(sizes) / len(sizes)
-    # print(f'Average batch size: {ave:.3f}')
-    # print(batches[100])
-    # print(batches[100].batch_k[0])
+
+"""
+python dataset.py --data_path=data/dialogues_test.txt \
+    --kw_path=data/keywords_test.txt \
+    --batch_size=3000 \
+    --pickle_path=daily_test_3000.pickle
+
+python dataset.py --data_path=data/dialogues_train.txt \
+    --kw_path=data/keywords_train.txt \
+    --batch_size=2500 \
+    --pickle_path=daily_train_2500.pickle
+"""
