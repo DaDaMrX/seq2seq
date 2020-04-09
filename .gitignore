@@ -4,8 +4,7 @@
 **/*.pt
 **/*.pickle
 **/*.ipynb
-**/*.txt
-**/text*.*
+**/test*.*
 archive
 bert-base-uncased
 checkpoints

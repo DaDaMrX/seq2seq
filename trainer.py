@@ -6,6 +6,7 @@ import random
 import shutil
 import time
 
+import apex
 import pynvml
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -55,6 +56,10 @@ class Trainer:
         self.model = self.model.to(self.device)
         self.logger.info(f'Moving model to {self.device} done.')
         self.optim = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
+
+        torch.cuda.set_device(self.device)
+        self.model, self.optim = apex.amp.initialize(
+            self.model, self.optim, opt_level='O2')
 
     def get_device(self):
         if args.n_gpu <= 0:
@@ -178,7 +183,8 @@ class Trainer:
 
         # Backward & Optim
         loss = loss / self.args.n_accum_batches
-        loss.backward()
+        with apex.amp.scale_loss(loss, self.optim) as scaled_loss:
+            scaled_loss.backward()
         self.train_steps += 1
         if self.train_steps % self.args.n_accum_batches == 0:
             self.optim.step()
@@ -304,8 +310,8 @@ if __name__ == '__main__':
     parser.add_argument('--clear', action='store_true')
     parser.add_argument('--use_keywords', action='store_true')
 
-    parser.add_argument('--train_pickle_path')
-    parser.add_argument('--test_pickle_path')
+    parser.add_argument('--train_pickle_path', default='daily_train_2500.pickle')
+    parser.add_argument('--test_pickle_path', default='daily_test_3000.pickle')
     parser.add_argument('--lr', default='1e-5', type=float)
     parser.add_argument('--response_loss_weight', default=0.5, type=float)
     parser.add_argument('--keywords_loss_weight', default=0.5, type=float)
@@ -331,10 +337,7 @@ if __name__ == '__main__':
         trainer.fit()
 
 """
-python trainer.py -t overfit --overfit 200 --clear \
-    --train_pickle_path=daily_train_2500.pickle
+python trainer.py -t overfit --overfit 200 --clear
 
-python trainer.py -t train --resume \
-    --train_pickle_path=daily_train_2500.pickle \
-    --test_pickle_path=daily_test_3000.pickle
+python trainer.py -t seq --clear
 """
