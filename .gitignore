@@ -6,7 +6,8 @@
 **/*.ipynb
 **/test*.*
 archive
-bert-base-uncased
-checkpoints
+pretrain
 data
+pickle
+checkpoints
 runs

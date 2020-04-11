@@ -1,6 +1,7 @@
 import argparse
 import logging
 import pickle
+import random
 import re
 
 import torch
@@ -8,37 +9,24 @@ from tqdm import tqdm
 from transformers import BertTokenizer
 
 
-class Example:
+class Data(dict):
 
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+    __setattr__ = dict.__setitem__
+
+    def __getattr__(self, attr):
+        if attr in self.keys():
+            return self.__getitem__(attr)
+        else:
+            super().__getattr__(attr)
 
     def size(self):
-        num = 0
-        if hasattr(self, 'x'):
-            num += len(self.x)
-        if hasattr(self, 'y'):
-            num += len(self.y)
-        if hasattr(self, 'k'):
-            num += len(self.k)
-        return num
+        attrs = ['x', 'y', 'k']
+        return sum(len(self[key]) for key in attrs if key in self)
 
-    def __repr__(self):
-        items = []
-        for k, v in self.__dict__.items():
-            text = f'{k}: '
-            if isinstance(v, list):
-                text += f'List[{type(v[0])}], len={len(v)}'
-            elif isinstance(v, tuple):
-                text += f'Tuple[{type(v[0])}], len={len(v)}'
-            elif isinstance(v, str):
-                text += f'str: {v}'
-            else:
-                text += f'{type(v)}'
-            text = '    ' + text + ','
-            items.append(text)
-        items = '\n'.join(items)
-        return f'Example(\n{items}\n)'
+    def to(self, device):
+        for k, v in self.items():
+            if isinstance(v, torch.Tensor):
+                self[k] = v.to(device)
 
 
 class DailyDataset:
@@ -57,7 +45,6 @@ class DailyDataset:
         self.data = self.make_pairs(convs)
         if keywords_path is not None:
             self.data = self.load_keywords()
-        self.data.sort(key=lambda t: sum(map(len, t[0])) + len(t[1]))
         self.examples = self.make_examples()
 
     def get_logger(self, class_name):
@@ -125,14 +112,17 @@ class DailyDataset:
 
     def make_examples(self):
         self.examples = []
-        for d in tqdm(self.data, desc='Making Examples', dynamic_ncols=True):
-            self.examples.append(self.make_example(d))
+        for index, item in enumerate(tqdm(self.data, desc='Make Examples')):
+            self.examples.append(self.make_example(index, item))
         return self.examples
 
-    def make_example(self, item):
+    def make_example(self, index, item):
+        example = Data(index=index)
+
         context, text_y = item[0], item[1]
+        example.texts_x = context
         text_y = self.tokenizer.convert_tokens_to_string(self.tokenizer.tokenize(text_y))
-        example = Example(texts_x=context, text_y=text_y)
+        example.text_y = text_y
 
         example.x = []
         for sent in reversed(context):
@@ -155,40 +145,20 @@ class DailyDataset:
         return example
 
 
-class Batch:
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def to(self, device):
-        for k, v in self.__dict__.items():
-            if isinstance(v, torch.Tensor):
-                self.__dict__[k] = v.to(device)
-
-    def __repr__(self):
-        items = []
-        for k, v in self.__dict__.items():
-            text = f'{k}: '
-            if isinstance(v, torch.Tensor):
-                text += f'{v.shape}, {v.dtype}'
-            elif isinstance(v, list):
-                text += f'List[{type(v[0])}], len={len(v)}'
-            elif isinstance(v, tuple):
-                text += f'Tuple[{type(v[0])}], len={len(v)}'
-            else:
-                text += f'type={type(v)}, {v}'
-            text = '    ' + text + ','
-            items.append(text)
-        items = '\n'.join(items)
-        return f'Batch(\n{items}\n)'
-
-
 class DataLoader:
 
-    def __init__(self, dataset, max_tokens=2500):
-        self.dataset = dataset
+    def __init__(self, examples, max_tokens, pad_value=0):
+        self.examples = examples
         self.max_tokens = max_tokens
+        self.pad_value = pad_value
         self.logger = self.get_logger('DataLoader')
+
+        # Sort & filter
+        random.shuffle(self.examples)
+        self.examples.sort(key=lambda e: len(e.x) + len(e.y))
+        while self.examples[-1].size() > self.max_tokens:
+            self.examples.pop()
+
         self.batches = self.make_batches()
 
     def get_logger(self, class_name):
@@ -214,52 +184,39 @@ class DataLoader:
         return len(self.batches)
 
     def make_batches(self):
-        batches = []
-        examples, num = [], 0
-        for example in tqdm(self.dataset, desc='Batching', dynamic_ncols=True):
-            num += example.size()
-            examples.append(example)
-            if num == self.max_tokens:
-                batches.append(self.make_batch(examples))
-                examples, num = [], 0
-            elif num > self.max_tokens:
-                batches.append(self.make_batch(examples[:-1]))
-                examples, num = [example], example.size()
-        self.logger.info(f'{len(batches)} batches.')
-        return batches
+        # Chunk of size `self.max_tokens` by Two pointers (left & right)
+        self.batches = []
+        left, size = 0, 0
+        for right, example in enumerate(tqdm(self.examples, desc='Make Batches')):
+            size += example.size()
+            if size > self.max_tokens:
+                self.batches.append(self.make_batch(self.examples[left:right]))
+                left, size = right, example.size()
+        self.batches.append(self.make_batch(self.examples[left:]))
+
+        self.logger.info(f'{len(self.batches)} Batches')
+        return self.batches
 
     def make_batch(self, examples):
-        has_keywords = hasattr(examples[0], 'k')
-        batch_x, batch_y = [], []
-        batch_texts_x, batch_text_y = [], []
-        if has_keywords:
-            batch_k = []
-            batch_tokens_k = []
-        for example in examples:
-            batch_x.append(torch.tensor(example.x))
-            batch_y.append(torch.tensor(example.y))
-            batch_texts_x.append(example.texts_x)
-            batch_text_y.append(example.text_y)
-            if has_keywords:
-                batch_k.append(torch.tensor(example.k))
-                batch_tokens_k.append(example.tokens_k)
+        # Zip
+        batch = Data(**{key: [] for key in examples[0].keys()})
+        for e in examples:
+            for k, v in batch.items():
+                v.append(e[k])
 
-        padding_value = self.dataset.tokenizer.pad_token_id
-        batch_x = torch.nn.utils.rnn.pad_sequence(
-            batch_x, batch_first=True, padding_value=padding_value)
-        batch_y = torch.nn.utils.rnn.pad_sequence(
-            batch_y, batch_first=True, padding_value=padding_value)
-        batch = Batch(
-            batch_x=batch_x,
-            batch_y=batch_y,
-            batch_texts_x=batch_texts_x,
-            batch_text_y=batch_text_y,
-        )
-        if has_keywords:
-            batch_k = torch.nn.utils.rnn.pad_sequence(
-                batch_k, batch_first=True, padding_value=padding_value)
-            batch.batch_k = batch_k
-            batch.batch_tokens_k = batch_tokens_k
+        # Pad
+        def pad_sequence(sequence):
+            return torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(x) for x in sequence],
+                batch_first=True,
+                padding_value=self.pad_value,
+            )
+
+        batch.x = pad_sequence(batch.x)
+        batch.y = pad_sequence(batch.y)
+        if hasattr(batch, 'k'):
+            batch.k = pad_sequence(batch.k)
+
         return batch
 
 
@@ -273,7 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('--context_size', default=5, type=int)
     args = parser.parse_args()
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased/')
+    tokenizer = BertTokenizer.from_pretrained('pretrain/vocab.txt')
     tokenizer.add_special_tokens({'bos_token': '[BOS]'})
 
     dataset = DailyDataset(
@@ -284,20 +241,25 @@ if __name__ == '__main__':
         context_size=args.context_size,
     )
     dataloader = DataLoader(
-        dataset=dataset,
+        examples=dataset.examples,
         max_tokens=args.batch_size,
+        pad_value=tokenizer.pad_token_id,
     )
     dataloader.dump(args.pickle_path)
+
+    batch = dataloader.batches[100]
+    for k, v in batch.items():
+        print(f'    {k}: {type(v)}')
 
 
 """
 python dataset.py --data_path=data/dialogues_test.txt \
     --kw_path=data/keywords_test.txt \
-    --batch_size=3000 \
-    --pickle_path=daily_test_3000.pickle
+    --batch_size=4000 \
+    --pickle_path=pickle/daily_test_4000.pickle
 
 python dataset.py --data_path=data/dialogues_train.txt \
     --kw_path=data/keywords_train.txt \
-    --batch_size=2500 \
-    --pickle_path=daily_train_2500.pickle
+    --batch_size=3000 \
+    --pickle_path=pickle/daily_train_3000.pickle
 """
