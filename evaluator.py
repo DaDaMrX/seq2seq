@@ -1,38 +1,51 @@
+import argparse
+import os
 import time
-from threading import Thread
 from pprint import pprint
 
 import pymongo
 import sklearn
-from torch.utils.tensorboard import SummaryWriter
 from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Evaluator:
 
-    def __init__(self, tag, host='127.0.0.1', port=27017, db_name='kwseq'):
-        self.tag = tag
-        self.writer = SummaryWriter(f'runs/{self.tag}')
-        self.client = pymongo.MongoClient(host, port)
+    def __init__(self, args):
+        self.args = args
+        if self.args.tb_tag:
+            tb_dir = os.path.join(self.args.tensorboard_base_dir, self.args.tag)
+            self.writer = SummaryWriter(tb_dir)
 
-        self.test_collection = self.client[db_name][f'{self.tag}-test']
+        self.client = pymongo.MongoClient('127.0.0.1', self.args.mongodb_port)
+        self.db = self.client[self.args.mongodb_db_name]
+        self.test_collection = self.db[f'{self.args.tag}-test']
+        self.result_collection = self.db[f'{self.args.tag}-result']
+
+        self.target_y, self.target_k = self.load_target()
+        self.len = len(self.target_y)
+        print((f'Find {len(self.target_y)} Target repsones, '
+               f'{len(self.target_k)} Target keywords.'))
+
+    def load_target(self):
+        while self.test_collection.count_documents({'epoch': 0}) == 0:
+            time.sleep(self.args.period)
+
         self.target_y, self.target_k = [], []
         for doc in self.test_collection.find({'epoch': 0}).sort('index'):
             self.target_y.append(doc['y'])
-            if 'k' in doc:
+            if self.args.use_keywords:
                 self.target_k.append(doc['k'])
-        self.len = len(self.target_y)
-        assert len(self.target_k) == 0 or len(self.target_k) == self.len
 
-        self.result_collection = self.client[db_name][f'{self.tag}-result']
+        return self.target_y, self.target_k
 
-    def monitor(self, start_epoch=1, period=60):
-        epoch = start_epoch
+    def monitor(self):
+        epoch = self.args.start_epoch
         while True:
-            if self.test_collection.count_documents({'epoch': epoch}) < self.len:
-                time.sleep(period)
-                continue
-            print(f'Epoch {epoch}')
+            print(f'Waiting Epoch {epoch}...')
+            while self.test_collection.count_documents({'epoch': epoch}) < self.len:
+                time.sleep(self.args.period)
+            print(f'Find Epoch {epoch}:')
             self.evaluate(epoch)
             epoch += 1
 
@@ -40,19 +53,18 @@ class Evaluator:
         y, k = [], []
         for doc in self.test_collection.find({'epoch': epoch}).sort('index'):
             y.append(doc['y'])
-            if 'k' in doc:
+            if self.args.use_keywords:
                 k.append(doc['k'])
-        assert len(y) == self.len
-        assert len(k) == 0 or len(k) == self.len
+        print(f'Find {len(y)} Repsones, {len(k)} Keywords.')
 
         results = {'epoch': epoch}
         results.update(self.bleu(y))
-        if len(k) > 0:
+        if self.args.use_keywords:
             results.update(self.kw_metric(k))
 
         pprint(results)
         self.result_collection.insert_one(results)
-        if self.writer is not None:
+        if hasattr(self, 'writer'):
             if 'BLEU-4' in results:
                 for k in ['BLEU-1', 'BLEU-2', 'BLEU-3', 'BLEU-4']:
                     self.writer.add_scalar(f'test-BLEU/{k}', results[k], epoch)
@@ -62,10 +74,11 @@ class Evaluator:
 
     def bleu(self, y_pred, ranks=[1, 2, 3, 4]):
         assert len(y_pred) == len(self.target_y)
+        target_y = [[s] for s in self.target_y]
         scores = {}
         for rank in ranks:
             scores[f'BLEU-{rank}'] = corpus_bleu(
-                list_of_references=self.target_y,
+                list_of_references=target_y,
                 hypotheses=y_pred,
                 weights=(1 / rank,) * rank,
                 smoothing_function=SmoothingFunction().method1,
@@ -91,4 +104,20 @@ class Evaluator:
 
 
 if __name__ == '__main__':
-    Evaluator(tag='seq').monitor()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tag', '-t', required=True)
+    parser.add_argument('--tb_tag', default=None)
+    parser.add_argument('--start_epoch', default=1, type=int)
+    parser.add_argument('--use_keywords', action='store_true')
+    parser.add_argument('--period', default=60, type=int)
+    parser.add_argument('--tensorboard_base_dir', default='runs')
+    parser.add_argument('--mongodb_port', default=27017, type=int)
+    parser.add_argument('--mongodb_db_name', default='kwseq')
+    args = parser.parse_args()
+
+    Evaluator(args).monitor()
+
+
+"""
+python evaluator.py -t seq --tb_tag seq-metric
+"""

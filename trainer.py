@@ -43,20 +43,32 @@ class Trainer:
     def __init__(self, args):
         self.args = args
         self.logger = self.get_logger('Trainer')
+        self.random = random.Random(self.args.seed)
 
         self.device = torch.device(self.args.device_id)
         torch.cuda.set_device(self.device)
         self.logger.info(f'Use device {self.device}')
 
-        self.tokenizer = BertTokenizer(vocab_file=self.args.vocab_path)
+        self.tokenizer = BertTokenizer(self.args.vocab_path)
         self.tokenizer.add_special_tokens({'bos_token': '[BOS]'})
 
-        # Model
+        self.model, self.optim = self.load_model()
+        self.train_batches_all, self.test_batches_all = self.load_batches()
+
+        if self.args.is_worker:
+            self.tensorboard_dir, self.checkpoints_dir = self.prepare_dirs()
+            self.writer = SummaryWriter(self.tensorboard_dir)
+        self.recoder = Recoder(tag=self.args.tag,
+                               clear=self.args.clear,
+                               port=self.args.mongodb_port,
+                               db_name=self.args.mongodb_db_name)
+
+    def load_model(self):
         model_args = dict(
             tokenizer=self.tokenizer,
             max_decode_len=self.args.max_decode_len,
         )
-        if args.use_keywords:
+        if self.args.use_keywords:
             self.logger.info('Create KWSeq2Seq model...')
             self.model = KWSeq2Seq(**model_args)
         else:
@@ -90,28 +102,24 @@ class Trainer:
                 output_device=self.args.rank,
                 find_unused_parameters=True,
             )
+        return self.model, self.optim
 
-        # Log
-        if self.args.is_worker:
-            self.tensorboard_dir, self.checkpoints_dir = self.prepare_dirs()
-            self.writer = SummaryWriter(self.tensorboard_dir)
-        self.recoder = Recoder(tag=self.args.tag,
-                               clear=self.args.clear,
-                               port=self.args.mongodb_port,
-                               db_name=self.args.mongodb_db_name)
+    def load_batches(self):
+        self.train_batches_all = None
+        self.test_batches_all = None
 
-        # Dataset
         if self.args.train_pickle_path:
-            self.train_batches_all = self.load_batches(self.args.train_pickle_path)
+            with open(self.args.train_pickle_path, 'rb') as f:
+                batches = pickle.load(f)
+            n, m = len(batches), self.args.n_gpu
+            r = (n + m - 1) // m * m - n
+            self.train_batches_all = batches + batches[:r]
+
         if self.args.test_pickle_path:
-            self.test_batches_all = self.load_batches(self.args.test_pickle_path)
-            self.test_batches = self.get_rank_batches(self.test_batches_all)
-            if self.args.is_worker:
-                self.recoder.record_target(self.test_batches_all)
-                # self.evaluator = Evaluator(tag=self.args.tag,
-                #                            writer=self.writer,
-                #                            port=self.args.mongodb_port,
-                #                            db_name=self.args.mongodb_db_name)
+            with open(self.args.test_pickle_path, 'rb') as f:
+                self.test_batches_all = pickle.load(f)
+
+        return self.train_batches_all, self.test_batches_all
 
     def get_logger(self, class_name):
         colors = ['', '\033[92m', '\033[93m', '\033[94m']
@@ -160,17 +168,6 @@ class Trainer:
         self.model.load_state_dict(state_dict, strict=True)
         return self.model
 
-    def load_batches(self, path):
-        with open(path, 'rb') as f:
-            batches = pickle.load(f)
-        r = len(batches) - len(batches) // self.args.n_gpu * self.args.n_gpu
-        batches += batches[:r]
-        return batches
-
-    def get_rank_batches(self, batches_all):
-        random.shuffle(batches_all)
-        return batches_all[self.args.rank::self.args.n_gpu]
-
     def loss_fn(self, input, target):
         loss = torch.nn.functional.cross_entropy(
             input=input.reshape(-1, input.size(-1)),
@@ -179,27 +176,6 @@ class Trainer:
             reduction='mean',
         )
         return loss
-
-    def overfit(self, n_steps):
-        batch = self.train_batches[100]
-        batch.to(self.device)
-
-        self.model.train().zero_grad()
-        self.epoch, self.train_steps = 0, 0
-        pbar = tqdm(range(n_steps), desc='Overfit', dynamic_ncols=True)
-        for i in pbar:
-            loss = self.train_batch(batch)
-            pbar.set_postfix({'loss': f'{loss:.4f}'})
-
-        self.test_steps = 0
-        pred = self.test_batch(batch)
-        for k, v in pred.items():
-            print(f'{k}: {v[0]:.4f}')
-
-        self.evaluator = Evaluator(batches=[batch])
-        scores = self.evaluator.evaluate(pred, epoch=0)
-        for k, v in scores.items():
-            print(f'{k}: {v}')
 
     def train_batch(self, batch):
         # Forward & Loss
@@ -233,7 +209,7 @@ class Trainer:
                 self.writer.add_scalar('_Loss/response', rsp_loss.item(), self.train_steps)
                 self.writer.add_scalar('_Loss/keywords', kw_loss.item(), self.train_steps)
 
-        if self.args.is_worker and self.train_steps % self.args.case_interval == 0:
+        if self.train_steps % self.args.case_interval == 0:
             y_pred_ids = logits.argmax(dim=-1)
             y_pred = self.batch_ids_to_strings(y_pred_ids)
             if self.args.use_keywords:
@@ -241,8 +217,12 @@ class Trainer:
                 k_pred = self.batch_ids_to_tokens(k_pred_ids)
             else:
                 k_pred = None
-            self.recoder.record(mode='train', epoch=self.epoch, step=self.train_steps,
-                                batch=batch, index=0, y_pred=y_pred, k_pred=k_pred)
+            self.recoder.record(
+                mode='train', epoch=self.epoch, step=self.train_steps, rank=self.args.rank,
+                texts_x=batch.texts_x[0], text_y=batch.text_y[0], y_pred=y_pred[0],
+                tokens_k=batch.tokens_k[0] if 'tokens_k' in batch else None,
+                k_pred=k_pred[0] if k_pred is not None else None,
+            )
         return loss.item()
 
     def train_epoch(self):
@@ -255,7 +235,7 @@ class Trainer:
         else:
             pbar = self.train_batches
         for batch in pbar:
-            loss = self.train_batch(batch)
+            loss = self.train_batch(batch)  # Core training
             if self.args.is_worker:
                 pbar.set_postfix({'loss': f'{loss:.4f}'})
 
@@ -265,25 +245,29 @@ class Trainer:
             torch.save(self.model.state_dict(), ckpt_path)
 
     def fit(self):
-        if not self.args.resume:
-            self.epoch = 0
-            self.train_steps, self.test_steps = 0, 0
-        else:
-            if hasattr(self, 'train_batches'):
-                self.train_steps = self.epoch * len(self.train_batches)
-            if hasattr(self, 'test_batches'):
-                self.test_steps = self.epoch * len(self.test_batches)
+        self.epoch = 0
+        self.train_steps, self.test_steps = 0, 0
+
+        if self.test_batches_all is not None:
+            self.test_batches = self.test_batches_all[self.args.rank::self.args.n_gpu]
+            if self.args.is_worker:
+                self.recoder.record_target(self.test_batches_all)
 
         while True:
             self.epoch += 1
-            if hasattr(self, 'train_batches_all'):
-                self.train_batches = self.get_rank_batches(self.train_batches_all)
+
+            if self.train_batches_all is not None:
+                self.random.shuffle(self.train_batches_all)
+                self.train_batches = self.train_batches_all[self.args.rank::self.args.n_gpu]
+                if self.args.n_gpu > 1:
+                    torch.distributed.barrier()
                 self.train_epoch()
-            if hasattr(self, 'test_batches_all'):
+
+            if self.test_batches_all is not None:
+                if self.args.n_gpu > 1:
+                    torch.distributed.barrier()
                 results = self.test_epoch()
                 self.recoder.record_output(results)
-                # if self.args.is_worker:
-                #     self.evaluator.evaluate(self.epoch)
 
     def test_epoch(self):
         self.model.eval()
@@ -295,7 +279,7 @@ class Trainer:
         else:
             pbar = self.test_batches
         for batch in pbar:
-            batch_results = self.test_batch(batch)
+            batch_results = self.test_batch(batch)  # Core testing
             results += batch_results
             if self.args.is_worker:
                 pbar.set_postfix({'step': self.test_steps})
@@ -309,18 +293,24 @@ class Trainer:
             y_pred = self.batch_ids_to_strings(y_pred_ids)
             k_pred = self.batch_ids_to_tokens(k_pred_ids)
             for i, y, k in zip(batch.index, y_pred, k_pred):
-                results.append({'epoch': self.epoch, 'index': i, 'y': y, 'k': k})
+                results.append({'epoch': self.epoch, 'index': i, 'rank': self.args.rank,
+                                'y': y, 'k': k})
         else:
             y_pred_ids = self.model(mode='test', x=batch.x)
             y_pred = self.batch_ids_to_strings(y_pred_ids)
             for i, y in zip(batch.index, y_pred):
-                results.append({'epoch': self.epoch, 'index': i, 'y': y})
+                results.append({'epoch': self.epoch, 'index': i, 'rank': self.args.rank,
+                                'y': y})
             k_pred = None
 
         self.test_steps += 1
-        if self.args.is_worker and self.test_steps % self.args.case_interval == 0:
-            self.recoder.record(mode='test', epoch=self.epoch, step=self.test_steps,
-                                batch=batch, index=0, y_pred=y_pred, k_pred=k_pred)
+        if self.test_steps % self.args.case_interval == 0:
+            self.recoder.record(
+                mode='test', epoch=self.epoch, step=self.test_steps, rank=self.args.rank,
+                texts_x=batch.texts_x[0], text_y=batch.text_y[0], y_pred=y_pred[0],
+                tokens_k=batch.tokens_k[0] if 'tokens_k' in batch else None,
+                k_pred=k_pred[0] if k_pred is not None else None,
+            )
         return results
 
     def batch_ids_to_strings(self, batch_ids):
@@ -348,19 +338,14 @@ def train(rank, device_ids, args):
     args.rank = rank
     args.device_id = device_ids[rank]
     args.is_worker = rank == args.n_gpu - 1
-    random.seed(args.seed)
 
     trainer = Trainer(args)
-    if args.overfit > 0:
-        trainer.overfit(args.overfit)
-    else:
-        trainer.fit()
+    trainer.fit()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--tag', '-t', required=True)
-    parser.add_argument('--overfit', '-o', default=-1, type=int)
     parser.add_argument('--resume', '-r', action='store_true')
     parser.add_argument('--clear', action='store_true')
     parser.add_argument('--use_keywords', action='store_true')
@@ -371,7 +356,7 @@ if __name__ == '__main__':
     parser.add_argument('--response_loss_weight', default=0.5, type=float)
     parser.add_argument('--keywords_loss_weight', default=0.5, type=float)
     parser.add_argument('--n_gpu', default=1, type=int)
-    parser.add_argument('--n_accum_batches', default=2, type=int)
+    parser.add_argument('--n_accum_batches', default=1, type=int)
 
     parser.add_argument('--pretrain_path', default='pretrain/bert-base-uncased.bin')
     parser.add_argument('--vocab_path', default='pretrain/vocab.txt')
@@ -402,7 +387,7 @@ if __name__ == '__main__':
 """
 python trainer.py -t overfit --overfit 200 --clear
 
-python trainer.py -t seq --clear --n_gpu=2 \
+python trainer.py -t seq --clear --n_gpu=3 \
     --train_pickle_path=pickle/daily_train_3000.pickle \
-    --test_pickle_path=pickle/daily_test_4000.pickle
+    --test_pickle_path=pickle/daily_test_5000.pickle
 """

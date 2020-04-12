@@ -12,20 +12,24 @@ class Recoder:
             self.log_collection.drop()
             self.test_collection.drop()
 
-    def record(self, mode, epoch, step, batch, index, y_pred, k_pred=None):
+    def record(self, mode, epoch, step, rank, texts_x,
+               text_y, y_pred, tokens_k=None, k_pred=None):
         assert mode in ['train', 'test']
-        doc = {'mode': mode, 'epoch': epoch, 'step': step}
+        doc = {
+            'mode': mode, 'epoch': epoch,
+            'step': step, 'rank': rank,
+        }
 
         doc['context'] = []
         names = ['A', 'B']
-        for i, sent in enumerate(batch.texts_x[index]):
+        for i, sent in enumerate(texts_x):
             doc['context'].append(names[i & 1] + ': ' + sent)
-        doc['targ'] = batch.text_y[index]
-        doc['pred'] = y_pred[index]
+        doc['targ'] = text_y
+        doc['pred'] = y_pred
 
         if k_pred is not None:
-            doc['kw_targ'] = ' '.join(batch.tokens_k[index])
-            doc['kw_pred'] = ' '.join(k_pred[index])
+            doc['kw_targ'] = ' '.join(tokens_k)
+            doc['kw_pred'] = ' '.join(k_pred)
 
         self.log_collection.insert_one(doc)
 

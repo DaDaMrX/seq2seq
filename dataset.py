@@ -255,8 +255,8 @@ if __name__ == '__main__':
 """
 python dataset.py --data_path=data/dialogues_test.txt \
     --kw_path=data/keywords_test.txt \
-    --batch_size=4000 \
-    --pickle_path=pickle/daily_test_4000.pickle
+    --batch_size=5000 \
+    --pickle_path=pickle/daily_test_5000.pickle
 
 python dataset.py --data_path=data/dialogues_train.txt \
     --kw_path=data/keywords_train.txt \
