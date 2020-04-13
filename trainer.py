@@ -64,9 +64,12 @@ class Trainer:
                                db_name=self.args.mongodb_db_name)
 
     def load_model(self):
+        if self.args.pretrain_path == '' or self.args.resume:
+            self.args.pretrain_path = None
         model_args = dict(
             tokenizer=self.tokenizer,
             max_decode_len=self.args.max_decode_len,
+            pretrain_path=self.args.pretrain_path,
         )
         if self.args.use_keywords:
             self.logger.info('Create KWSeq2Seq model...')
@@ -75,12 +78,6 @@ class Trainer:
             self.logger.info('Create Seq2Seq model...')
             self.model = Seq2Seq(**model_args)
 
-        if self.args.resume:
-            self.model = self.resume()
-        elif self.args.pretrain_path is not None:
-            self.logger.info(f'Load pretrain from "{self.args.pretrain_path}"...')
-            self.model.load_pretrain(self.args.pretrain_path)
-
         self.logger.info(f'Moving model to {self.device}...')
         self.model = self.model.to(self.device)
         self.logger.info(f'Moving model to {self.device} done.')
@@ -88,6 +85,9 @@ class Trainer:
 
         self.model, self.optim = apex.amp.initialize(
             self.model, self.optim, opt_level='O2')
+
+        if self.args.resume:
+            self.model, self.optim = self.resume()
 
         if self.args.n_gpu > 1:
             torch.distributed.init_process_group(
@@ -162,11 +162,14 @@ class Trainer:
                  for name in os.listdir(self.checkpoints_dir)}
         assert len(ckpts) > 0
         self.epoch = max(ckpts)
-        latest_path = os.path.join(self.checkpoints_dir, ckpts[self.epoch])
-        self.logger.info(f'Load checkpoint from "{latest_path}"...')
-        state_dict = torch.load(latest_path, map_location=self.device)
-        self.model.load_state_dict(state_dict, strict=True)
-        return self.model
+        path = os.path.join(self.checkpoints_dir, ckpts[self.epoch])
+
+        self.logger.info(f'Load checkpoint from "{path}"...')
+        state_dict = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(state_dict['model'], strict=True)
+        self.optim.load_state_dict(state_dict['optim'])
+        apex.amp.load_state_dict(state_dict['amp'])
+        return self.model, self.optim
 
     def loss_fn(self, input, target):
         loss = torch.nn.functional.cross_entropy(
@@ -239,13 +242,24 @@ class Trainer:
                 pbar.set_postfix({'loss': f'{loss:.4f}'})
 
         if self.args.is_worker:
+            state_dict = {
+                'model': self.model.state_dict(),
+                'optim': self.optim.state_dict(),
+                'amp': apex.amp.state_dict(),
+            }
             ckpt_path = os.path.join(
                 self.checkpoints_dir, f'{self.args.tag}-epoch-{self.epoch}.pt')
-            torch.save(self.model.state_dict(), ckpt_path)
+            torch.save(state_dict, ckpt_path)
 
     def fit(self):
-        self.epoch = 0
-        self.train_steps, self.test_steps = 0, 0
+        if not self.args.resume:
+            self.epoch = 0
+            self.train_steps, self.test_steps = 0, 0
+        else:
+            if self.train_batches_all is not None:
+                self.train_steps = self.epoch * len(self.train_batches_all) // self.args.n_gpu
+            if self.test_batches_all is not None:
+                self.test_steps = self.epoch * len(self.test_batches_all) // self.args.n_gpu
 
         if self.test_batches_all is not None:
             self.test_batches = self.test_batches_all[self.args.rank::self.args.n_gpu]
