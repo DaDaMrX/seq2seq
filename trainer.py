@@ -182,9 +182,8 @@ class Trainer:
         batch.to(self.device)
         if self.args.use_keywords:
             gt_kw_prob = 1
-            rsp_logits, kw_logits = self.model(
-                mode='train', x=batch.x, y=batch.y,
-                k=batch.k, gt_kw_prob=gt_kw_prob)
+            rsp_logits, kw_logits = self.model(mode='train', x=batch.x, y=batch.y,
+                                               k=batch.k, gt_kw_prob=gt_kw_prob)
             rsp_loss = self.loss_fn(input=rsp_logits, target=batch.y)
             kw_loss = self.loss_fn(input=kw_logits, target=batch.k)
             loss = self.args.response_loss_weight * rsp_loss + \

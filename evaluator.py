@@ -14,7 +14,7 @@ class Evaluator:
     def __init__(self, args):
         self.args = args
         if self.args.tb_tag:
-            tb_dir = os.path.join(self.args.tensorboard_base_dir, self.args.tag)
+            tb_dir = os.path.join(self.args.tensorboard_base_dir, self.args.tb_tag)
             self.writer = SummaryWriter(tb_dir)
 
         self.client = pymongo.MongoClient('127.0.0.1', self.args.mongodb_port)
