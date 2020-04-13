@@ -49,19 +49,13 @@ class Trainer:
         torch.cuda.set_device(self.device)
         self.logger.info(f'Use device {self.device}')
 
+        self.prepare_stuff()
+
         self.tokenizer = BertTokenizer(self.args.vocab_path)
         self.tokenizer.add_special_tokens({'bos_token': '[BOS]'})
 
         self.model, self.optim = self.load_model()
         self.train_batches_all, self.test_batches_all = self.load_batches()
-
-        if self.args.is_worker:
-            self.tensorboard_dir, self.checkpoints_dir = self.prepare_dirs()
-            self.writer = SummaryWriter(self.tensorboard_dir)
-        self.recoder = Recoder(tag=self.args.tag,
-                               clear=self.args.clear,
-                               port=self.args.mongodb_port,
-                               db_name=self.args.mongodb_db_name)
 
     def load_model(self):
         if self.args.pretrain_path == '' or self.args.resume:
@@ -72,10 +66,10 @@ class Trainer:
             pretrain_path=self.args.pretrain_path,
         )
         if self.args.use_keywords:
-            self.logger.info('Create KWSeq2Seq model...')
+            self.logger.info('Creating KWSeq2Seq model...')
             self.model = KWSeq2Seq(**model_args)
         else:
-            self.logger.info('Create Seq2Seq model...')
+            self.logger.info('Creating Seq2Seq model...')
             self.model = Seq2Seq(**model_args)
 
         self.logger.info(f'Moving model to {self.device}...')
@@ -84,7 +78,7 @@ class Trainer:
         self.optim = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
 
         self.model, self.optim = apex.amp.initialize(
-            self.model, self.optim, opt_level='O2')
+            self.model, self.optim, opt_level='O2', verbosity=0)
 
         if self.args.resume:
             self.model, self.optim = self.resume()
@@ -137,25 +131,34 @@ class Trainer:
         self.logger.addHandler(hander)
         return self.logger
 
-    def prepare_dirs(self):
-        self.tensorboard_dir = os.path.join(
-            self.args.tensorboard_base_dir, self.args.tag)
+    def prepare_stuff(self):
+        # Recoder
+        self.recoder = Recoder(tag=self.args.tag,
+                               clear=self.args.clear,
+                               port=self.args.mongodb_port,
+                               db_name=self.args.mongodb_db_name)
+
+        # Tensorboard
+        if self.args.is_worker:
+            self.tensorboard_dir = os.path.join(
+                self.args.tensorboard_base_dir, self.args.tag)
+            if self.args.clear and os.path.exists(self.tensorboard_dir):
+                shutil.rmtree(self.tensorboard_dir)
+                self.logger.info(f'Clear "{self.tensorboard_dir}"')
+                time.sleep(1)
+            self.writer = SummaryWriter(self.tensorboard_dir)
+
+        # Checkpoint
         self.checkpoints_dir = os.path.join(
             self.args.checkpoints_base_dir, self.args.tag)
-
-        for d in [self.tensorboard_dir, self.checkpoints_dir]:
-            if os.path.exists(d):
-                if self.args.clear:
-                    self.logger.info(f'Clear "{d}"')
-                    shutil.rmtree(d)
-                    time.sleep(1)
-                elif self.args.resume:
-                    continue
-                else:
-                    raise RuntimeError(f'"{d}" already exsits.')
-            os.makedirs(d)
-
-        return self.tensorboard_dir, self.checkpoints_dir
+        if self.args.is_worker:
+            if self.args.resume:
+                assert os.path.exists(self.checkpoints_dir)
+            else:
+                if self.args.clear and os.path.exists(self.checkpoints_dir):
+                    shutil.rmtree(self.checkpoints_dir)
+                    self.logger.info(f'Clear "{self.checkpoints_dir}"')
+                os.makedirs(self.checkpoints_dir)
 
     def resume(self):
         ckpts = {int(os.path.splitext(name)[0].split('-')[-1]): name
@@ -164,7 +167,7 @@ class Trainer:
         self.epoch = max(ckpts)
         path = os.path.join(self.checkpoints_dir, ckpts[self.epoch])
 
-        self.logger.info(f'Load checkpoint from "{path}"...')
+        self.logger.info(f'Resume from "{path}"')
         state_dict = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state_dict['model'], strict=True)
         self.optim.load_state_dict(state_dict['optim'])
@@ -184,13 +187,10 @@ class Trainer:
         # Forward & Loss
         batch.to(self.device)
         if self.args.use_keywords:
-            gt_kw_prob = 1
-            rsp_logits, kw_logits = self.model(mode='train', x=batch.x, y=batch.y,
-                                               k=batch.k, gt_kw_prob=gt_kw_prob)
-            rsp_loss = self.loss_fn(input=rsp_logits, target=batch.y)
-            kw_loss = self.loss_fn(input=kw_logits, target=batch.k)
-            loss = self.args.response_loss_weight * rsp_loss + \
-                self.args.keywords_loss_weight * kw_loss
+            logits, k_logits = self.model(mode='train', x=batch.x, y=batch.y, k=batch.k)
+            y_loss = self.loss_fn(input=logits, target=batch.y)
+            k_loss = self.loss_fn(input=k_logits, target=batch.k)
+            loss = self.args.y_loss_weight * y_loss + self.args.k_loss_weight * k_loss
         else:
             logits = self.model(mode='train', x=batch.x, y=batch.y)
             loss = self.loss_fn(input=logits, target=batch.y)
@@ -208,14 +208,14 @@ class Trainer:
         if self.args.is_worker:
             self.writer.add_scalar('_Loss/all', loss.item(), self.train_steps)
             if self.args.use_keywords:
-                self.writer.add_scalar('_Loss/response', rsp_loss.item(), self.train_steps)
-                self.writer.add_scalar('_Loss/keywords', kw_loss.item(), self.train_steps)
+                self.writer.add_scalar('_Loss/y_loss', y_loss.item(), self.train_steps)
+                self.writer.add_scalar('_Loss/k_loss', k_loss.item(), self.train_steps)
 
         if self.train_steps % self.args.case_interval == 0:
-            y_pred_ids = logits.argmax(dim=-1)
+            y_pred_ids = logits.argmax(dim=-1).tolist()
             y_pred = self.batch_ids_to_strings(y_pred_ids)
             if self.args.use_keywords:
-                k_pred_ids = kw_logits.argmax(dim=-1)
+                k_pred_ids = k_logits.argmax(dim=-1).tolist()
                 k_pred = self.batch_ids_to_tokens(k_pred_ids)
             else:
                 k_pred = None
@@ -241,15 +241,20 @@ class Trainer:
             if self.args.is_worker:
                 pbar.set_postfix({'loss': f'{loss:.4f}'})
 
+        # Checkpoint
         if self.args.is_worker:
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
             state_dict = {
-                'model': self.model.state_dict(),
+                'model': model_state_dict,
                 'optim': self.optim.state_dict(),
                 'amp': apex.amp.state_dict(),
             }
-            ckpt_path = os.path.join(
+            path = os.path.join(
                 self.checkpoints_dir, f'{self.args.tag}-epoch-{self.epoch}.pt')
-            torch.save(state_dict, ckpt_path)
+            torch.save(state_dict, path)
 
     def fit(self):
         if not self.args.resume:
@@ -303,14 +308,14 @@ class Trainer:
         results = []
         if self.args.use_keywords:
             y_pred_ids, k_pred_ids = self.model(mode='test', x=batch.x)
-            y_pred = self.batch_ids_to_strings(y_pred_ids)
-            k_pred = self.batch_ids_to_tokens(k_pred_ids)
+            y_pred = self.batch_ids_to_strings(y_pred_ids.tolist())
+            k_pred = self.batch_ids_to_tokens(k_pred_ids.tolist())
             for i, y, k in zip(batch.index, y_pred, k_pred):
                 results.append({'epoch': self.epoch, 'index': i, 'rank': self.args.rank,
                                 'y': y, 'k': k})
         else:
             y_pred_ids = self.model(mode='test', x=batch.x)
-            y_pred = self.batch_ids_to_strings(y_pred_ids)
+            y_pred = self.batch_ids_to_strings(y_pred_ids.tolist())
             for i, y in zip(batch.index, y_pred):
                 results.append({'epoch': self.epoch, 'index': i, 'rank': self.args.rank,
                                 'y': y})
@@ -328,14 +333,14 @@ class Trainer:
 
     def batch_ids_to_strings(self, batch_ids):
         strings = []
-        for ids in batch_ids.tolist():
+        for ids in batch_ids:
             tokens = self.ids_to_tokens(ids)
             string = self.tokenizer.convert_tokens_to_string(tokens)
             strings.append(string)
         return strings
 
     def batch_ids_to_tokens(self, batch_ids):
-        return [self.ids_to_tokens(ids) for ids in batch_ids.tolist()]
+        return [self.ids_to_tokens(ids) for ids in batch_ids]
 
     def ids_to_tokens(self, ids):
         tokens = self.tokenizer.convert_ids_to_tokens(ids)
@@ -360,17 +365,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--tag', '-t', required=True)
     parser.add_argument('--resume', '-r', action='store_true')
-    parser.add_argument('--clear', action='store_true')
-    parser.add_argument('--use_keywords', action='store_true')
+    parser.add_argument('--clear', '-c', action='store_true')
+    parser.add_argument('--use_keywords', '-k', action='store_true')
 
-    parser.add_argument('--train_pickle_path', default='')
-    parser.add_argument('--test_pickle_path', default='')
     parser.add_argument('--lr', default=1e-5, type=float)
-    parser.add_argument('--response_loss_weight', default=0.5, type=float)
-    parser.add_argument('--keywords_loss_weight', default=0.5, type=float)
+    parser.add_argument('--y_loss_weight', default=0.5, type=float)
+    parser.add_argument('--k_loss_weight', default=0.5, type=float)
     parser.add_argument('--n_gpu', default=1, type=int)
     parser.add_argument('--n_accum_batches', default=1, type=int)
 
+    parser.add_argument('--train_pickle_path', default='')
+    parser.add_argument('--test_pickle_path', default='')
     parser.add_argument('--pretrain_path', default='pretrain/bert-base-uncased.bin')
     parser.add_argument('--vocab_path', default='pretrain/vocab.txt')
     parser.add_argument('--checkpoints_base_dir', default='checkpoints')
@@ -398,9 +403,8 @@ if __name__ == '__main__':
 
 
 """
-python trainer.py -t overfit --overfit 200 --clear
-
-python trainer.py -t seq --clear --n_gpu=3 \
+python trainer.py -t test -c -k \
+    --n_gpu=4 \
     --train_pickle_path=pickle/daily_train_3000.pickle \
     --test_pickle_path=pickle/daily_test_5000.pickle
 """

@@ -4,7 +4,7 @@ import time
 from pprint import pprint
 
 import pymongo
-import sklearn
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
 from torch.utils.tensorboard import SummaryWriter
 
@@ -94,10 +94,10 @@ class Evaluator:
             for word in set(k_gt + k_pred):
                 truth.append(word in k_gt)
                 pred.append(word in k_pred)
-            scores['Accuracy'] += sklearn.metric.accuracy_score(truth, pred)
-            scores['Precision'] += sklearn.metric.precision_score(truth, pred)
-            scores['Recall'] += sklearn.metric.recall_score(truth, pred)
-            scores['F1'] += sklearn.metric.f1_score(truth, pred)
+            scores['Accuracy'] += accuracy_score(truth, pred)
+            scores['Precision'] += precision_score(truth, pred)
+            scores['Recall'] += recall_score(truth, pred)
+            scores['F1'] += f1_score(truth, pred)
         for name in scores:
             scores[name] /= len(self.target_k)
         return scores
@@ -107,8 +107,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--tag', '-t', required=True)
     parser.add_argument('--tb_tag', default=None)
+    parser.add_argument('--use_keywords', '-k', action='store_true')
     parser.add_argument('--start_epoch', default=1, type=int)
-    parser.add_argument('--use_keywords', action='store_true')
     parser.add_argument('--period', default=60, type=int)
     parser.add_argument('--tensorboard_base_dir', default='runs')
     parser.add_argument('--mongodb_port', default=27017, type=int)

@@ -36,9 +36,10 @@ def get_token_type_ids(x, sep_token_id):  # TODO
 class Seq2Seq(torch.nn.Module):
 
     def __init__(self, tokenizer, max_decode_len, pretrain_path=None):
-        super(Seq2Seq, self).__init__()
+        super().__init__()
         self.tokenizer = tokenizer
         self.max_decode_len = max_decode_len
+        self.pretrain_path = pretrain_path
 
         if self.pretrain_path is None:
             self.init_from_scratch()
@@ -57,14 +58,14 @@ class Seq2Seq(torch.nn.Module):
         self.dec_config.vocab_size = len(self.tokenizer)
         self.decoder = BertForMaskedLM(config=self.dec_config)
 
-    def init_from_pretrain(self, path):
+    def init_from_pretrain(self):
         self.enc_config = BertConfig(**BERT_CONFIG)
-        self.encoder = BertModel.from_pretrained(path, config=self.enc_config)
+        self.encoder = BertModel.from_pretrained(self.pretrain_path, config=self.enc_config)
         self.encoder.resize_token_embeddings(len(self.tokenizer))
 
         self.dec_config = BertConfig(**BERT_CONFIG)
         self.dec_config.is_decoder = True
-        self.decoder = BertForMaskedLM.from_pretrained(path, config=self.dec_config)
+        self.decoder = BertForMaskedLM.from_pretrained(self.pretrain_path, config=self.dec_config)
         self.decoder.resize_token_embeddings(len(self.tokenizer))
         for layer in self.decoder.bert.encoder.layer:
             state_dict = layer.attention.state_dict()
@@ -87,26 +88,14 @@ class Seq2Seq(torch.nn.Module):
             return self.forward_test(**kwargs)
 
     def forward_train(self, x, y):
-        token_type_ids = self.get_token_type_ids(x)
+        token_type_ids = get_token_type_ids(x, self.tokenizer.sep_token_id)
         encoder_hidden = self.encoder(x, token_type_ids=token_type_ids)[0]
         logits = self.decoder(y[:, :-1], encoder_hidden_states=encoder_hidden)[0]
         return logits
 
-    def get_token_type_ids(self, x):
-        token_type_ids = torch.zeros_like(x)
-        for i in range(x.size(0)):
-            sep_index = (x[i] == self.tokenizer.sep_token_id).nonzero()
-            sep_index = sep_index.squeeze(-1).tolist()
-            sep_index.append(len(x[0]))
-            sep_index.append(len(x[i]) - 1)
-            for j in range(0, len(sep_index) // 2 * 2, 2):
-                start, end = sep_index[j], sep_index[j + 1]
-                token_type_ids[i, start + 1:end + 1] = 1
-        return token_type_ids
-
     @torch.no_grad()
     def forward_test(self, x):
-        token_type_ids = self.get_token_type_ids(x)
+        token_type_ids = get_token_type_ids(x, self.tokenizer.sep_token_id)
         encoder_hidden = self.encoder(x, token_type_ids=token_type_ids)[0]
         return self.generate(encoder_hidden, x.size(0))
 
@@ -142,7 +131,7 @@ class Seq2Seq(torch.nn.Module):
 class KWSeq2Seq(torch.nn.Module):
 
     def __init__(self, tokenizer, max_decode_len, pretrain_path=None):
-        super(Seq2Seq, self).__init__()
+        super().__init__()
         self.tokenizer = tokenizer
         self.max_decode_len = max_decode_len
         self.pretrain_path = pretrain_path
@@ -252,12 +241,12 @@ class KWSeq2Seq(torch.nn.Module):
 
     @torch.no_grad()
     def forward_test(self, x):
-        token_type_ids = self.get_token_type_ids(x)
+        token_type_ids = get_token_type_ids(x, self.tokenizer.sep_token_id)
         encoder_hidden = self.encoder(x, token_type_ids=token_type_ids)[0]
 
         kw_ids = self.generate(self.kw_decoder, encoder_hidden, x.size(0))
 
-        kw_token_type_ids = self.get_token_type_ids(kw_ids)
+        kw_token_type_ids = get_token_type_ids(kw_ids, self.tokenizer.sep_token_id)
         kw_encoder_hidden = self.kw_encoder(kw_ids, token_type_ids=kw_token_type_ids)[0]
 
         hidden = torch.cat([encoder_hidden, kw_encoder_hidden], dim=1)
