@@ -35,11 +35,19 @@ def get_token_type_ids(x, sep_token_id):  # TODO
 
 class Seq2Seq(torch.nn.Module):
 
-    def __init__(self, tokenizer, max_decode_len):
+    def __init__(self, tokenizer, max_decode_len, pretrain_path=None):
         super(Seq2Seq, self).__init__()
         self.tokenizer = tokenizer
         self.max_decode_len = max_decode_len
 
+        if self.pretrain_path is None:
+            self.init_from_scratch()
+        else:
+            self.init_from_pretrain()
+
+        self.prepare_generation()
+
+    def init_from_scratch(self):
         self.enc_config = BertConfig(**BERT_CONFIG)
         self.enc_config.vocab_size = len(self.tokenizer)
         self.encoder = BertModel(config=self.enc_config)
@@ -49,9 +57,7 @@ class Seq2Seq(torch.nn.Module):
         self.dec_config.vocab_size = len(self.tokenizer)
         self.decoder = BertForMaskedLM(config=self.dec_config)
 
-        self.prepare_generation()
-
-    def load_pretrain(self, path):
+    def init_from_pretrain(self, path):
         self.enc_config = BertConfig(**BERT_CONFIG)
         self.encoder = BertModel.from_pretrained(path, config=self.enc_config)
         self.encoder.resize_token_embeddings(len(self.tokenizer))
@@ -63,8 +69,6 @@ class Seq2Seq(torch.nn.Module):
         for layer in self.decoder.bert.encoder.layer:
             state_dict = layer.attention.state_dict()
             layer.crossattention.load_state_dict(state_dict)
-
-        self.prepare_generation()
 
     def prepare_generation(self):
         def prepare_inputs_for_generation(self, input_ids, past, **kwargs):
