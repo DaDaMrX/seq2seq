@@ -1,7 +1,7 @@
 torch==1.4.0
 transformers==2.6.0
 pynvml==8.0.3
-tqdm==4.36.1
+tqdm==4.45.0
 pymongo==3.10.1
 scikit-learn==0.21.3
 nltk==3.4.5
