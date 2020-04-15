@@ -3,11 +3,11 @@ import pymongo
 
 class Recoder:
 
-    def __init__(self, tag, clear=False, host='127.0.0.1', port=27017, db_name='kwseq'):
+    def __init__(self, tag, clear=False, uri='mongodb://localhost:27017/', db='kwseq'):
         self.tag = tag
-        self.client = pymongo.MongoClient(host, port)
-        self.log_collection = self.client[db_name][f'{self.tag}-log']
-        self.test_collection = self.client[db_name][f'{self.tag}-test']
+        self.client = pymongo.MongoClient(uri)
+        self.log_collection = self.client[db][f'{self.tag}-log']
+        self.test_collection = self.client[db][f'{self.tag}-test']
         if clear:
             self.log_collection.drop()
             self.test_collection.drop()
