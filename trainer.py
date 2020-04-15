@@ -133,10 +133,8 @@ class Trainer:
 
     def prepare_stuff(self):
         # Recoder
-        self.recoder = Recoder(tag=self.args.tag,
-                               clear=self.args.clear,
-                               port=self.args.mongodb_port,
-                               db_name=self.args.mongodb_db_name)
+        self.recoder = Recoder(tag=self.args.tag, clear=self.args.clear,
+                               uri=self.args.mongodb_uri, db=self.args.mongodb_db)
 
         # Tensorboard
         if self.args.is_worker:
@@ -380,8 +378,8 @@ if __name__ == '__main__':
     parser.add_argument('--vocab_path', default='pretrain/vocab.txt')
     parser.add_argument('--checkpoints_base_dir', default='checkpoints')
     parser.add_argument('--tensorboard_base_dir', default='runs')
-    parser.add_argument('--mongodb_port', default=27017, type=int)
-    parser.add_argument('--mongodb_db_name', default='kwseq')
+    parser.add_argument('--mongodb_uri', default='mongodb://root:mongodbv100@localhost:27017')
+    parser.add_argument('--mongodb_db', default='kwseq')
     parser.add_argument('--case_interval', default=50, type=int)
 
     parser.add_argument('--max_decode_len', default=30, type=int)
@@ -403,8 +401,8 @@ if __name__ == '__main__':
 
 
 """
-python trainer.py -t test -c -k \
-    --n_gpu=4 \
+python trainer.py -t seq -c \
+    --n_gpu=3 \
     --train_pickle_path=pickle/daily_train_3000.pickle \
     --test_pickle_path=pickle/daily_test_5000.pickle
 """
