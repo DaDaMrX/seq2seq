@@ -145,6 +145,37 @@ class DailyDataset:
         return example
 
 
+def split_batches(batches, index_list):
+
+    def split(batch):
+        b1, b2 = Data(), Data()
+        s = len(next(iter(batch.values()))) // 2
+        for k, v in batch.items():
+            b1[k], b2[k] = v[:s], v[s:]
+        return b1, b2
+
+    index_list = [x for x in index_list]
+    batches_splited = []
+    for batch in batches:
+        if batch.index in index_list:
+            b1, b2 = split(batch)
+            batches_splited.append(b1)
+            batches_splited.append(b2)
+            index_list.remove(batch.index)
+        else:
+            batches_splited.append(batch)
+
+    print(f'Batches: {len(batches)} => {len(batches_splited)}')
+    if len(index_list) == 0:
+        print('All indexes splited.')
+    else:
+        print(f'{len(index_list)} not found:')
+        for index in index_list:
+            print(index)
+
+    return batches_splited
+
+
 class DataLoader:
 
     def __init__(self, examples, max_tokens, pad_value=0):
